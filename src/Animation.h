@@ -20,6 +20,11 @@ inline double armPosition(int side, double phase) { return side * std::cos(kPi *
 
 inline double squareProgress(double phase) { return std::clamp((phase - kSquareDwell) / (1.0 - kSquareDwell), 0.0, 1.0); }
 
+// Measures longer than kMaxBeatsPerLine wrap onto a second line, like a staff on sheet music.
+constexpr int kMaxBeatsPerLine = 6;
+inline int beatsPerLine(int beats) { return beats <= kMaxBeatsPerLine ? beats : (beats + 1) / 2; }
+inline int linesFor(int beats) { return beats <= kMaxBeatsPerLine ? 1 : 2; }
+
 // True parabola through a and b whose highest point is exactly at apexY (screen y grows downward).
 inline Point arcPoint(Point a, Point b, double apexY, double p) {
     const double rootA = std::sqrt(std::max(0.0, a.y - apexY));
@@ -95,4 +100,11 @@ struct FrameState {
     double beatSec = 1;
     double armPosition = 0;  // -1..1.
     int bpm = 120;
+
+    // The second measure's beat, when it plays over the first.
+    bool hasLayerBeat = false;
+    BeatEvent layerEvent;
+    double layerPhase = 0;
+    double layerSinceSec = 0;
+    double layerBeatSec = 1;
 };

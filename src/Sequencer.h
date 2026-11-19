@@ -39,7 +39,10 @@ private:
     void restartTransport();
     void planIfNeeded(int remainingFrames);
     void planBeat();
+    void planLayerBeats(const BeatEvent& lead);
     void fireTick();
+    void fireLayerTick();
+    int64_t layerDue() const;
     void startVoice(const BeatSettings& settings, double gain);
     void renderVoices(float* out, int frames, int channels);
     float voiceSample(Voice& voice);
@@ -65,6 +68,16 @@ private:
     int bpm_ = 120;
     uint32_t seenRevision_ = 0;
     int beatsSinceIncrease_ = 0;
+
+    // The second measure when it plays over the first. Its beats are placed at fixed points along the
+    // first measure's beats, counted in those beats, so the two stay locked through tempo changes.
+    static constexpr int kLayerQueueSize = 32;
+    int activeOverlap_ = OverlapOff;
+    int64_t leadIndex_ = 0;      // First-measure beats planned since the transport started.
+    double layerBarStart_ = 0;   // Where the current second-measure bar starts, in first-measure beats.
+    int layerBeat_ = 0;          // The next second-measure beat to plan.
+    std::array<BeatEvent, kLayerQueueSize> layerQueue_;
+    int layerHead_ = 0, layerCount_ = 0;
 
     std::array<Voice, 8> voices_;
     float master_ = 0.7f;

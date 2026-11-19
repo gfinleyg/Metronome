@@ -33,6 +33,11 @@ void Sequencer::restartTransport() {
     bpm_ = cfg_.bpm;
     seenRevision_ = cfg_.bpmRevision;
     beatsSinceIncrease_ = 0;
+    activeOverlap_ = OverlapOff;
+    leadIndex_ = 0;
+    layerBarStart_ = 0;
+    layerBeat_ = 0;
+    layerHead_ = layerCount_ = 0;
     beatBoundary_ = nextTick_ = double(pos_) + kStartLeadSeconds * sampleRate_;
 }
 
@@ -50,13 +55,23 @@ void Sequencer::planIfNeeded(int remainingFrames) {
 
 void Sequencer::planBeat() {
     if (planBeat_ == 0) {
-        // Time signature edits only take effect here, at a measure boundary.
-        if (!firstPlan_) planMeasure_ = (planMeasure_ == 0 && cfg_.secondMeasure) ? 1 : 0;
+        // Time signature and overlap edits only take effect here, at a measure boundary.
+        const int overlap = cfg_.secondMeasure ? cfg_.overlap : OverlapOff;
+        if (!firstPlan_) planMeasure_ = (planMeasure_ == 0 && cfg_.secondMeasure && overlap == OverlapOff) ? 1 : 0;
+        bool layerChanged = firstPlan_ || overlap != activeOverlap_;
         for (int m = 0; m < 2; ++m) {
+            layerChanged = layerChanged || activeBeats_[m] != cfg_.measure[m].beats || activeDenominator_[m] != cfg_.measure[m].denominator;
             activeBeats_[m] = cfg_.measure[m].beats;
             activeDenominator_[m] = cfg_.measure[m].denominator;
         }
         activeSecond_ = cfg_.secondMeasure;
+        activeOverlap_ = overlap;
+        // Over a bar of the same length, both measures start together every bar. Otherwise they only
+        // restart together when something about them changes.
+        if (planMeasure_ == 0 && (overlap == OverlapSameBar || layerChanged)) {
+            layerBarStart_ = double(leadIndex_);
+            layerBeat_ = 0;
+        }
     }
     if (cfg_.bpmRevision != seenRevision_) {
         seenRevision_ = cfg_.bpmRevision;
@@ -84,6 +99,7 @@ void Sequencer::planBeat() {
     e.bpmRevision = seenRevision_;
     e.runId = runId_;
     e.second = activeSecond_;
+    e.overlap = activeOverlap_;
     for (int m = 0; m < 2; ++m) {
         e.beats[m] = activeBeats_[m];
         e.denominator[m] = activeDenominator_[m];
@@ -92,7 +108,7 @@ void Sequencer::planBeat() {
         e.nextMeasure = planMeasure_;
         e.nextBeat = planBeat_ + 1;
     } else {
-        e.nextMeasure = (planMeasure_ == 0 && cfg_.secondMeasure) ? 1 : 0;
+        e.nextMeasure = (planMeasure_ == 0 && cfg_.secondMeasure && cfg_.overlap == OverlapOff) ? 1 : 0;
         e.nextBeat = 0;
     }
     ++beatsSinceIncrease_;
@@ -101,9 +117,58 @@ void Sequencer::planBeat() {
     planned_ = e;
     hasPlanned_ = true;
     pushEvent(e);
+    if (activeOverlap_ != OverlapOff) planLayerBeats(e);
+    ++leadIndex_;
 
     side_ = -side_;
     planBeat_ = (planBeat_ + 1 < activeBeats_[planMeasure_]) ? planBeat_ + 1 : 0;
+}
+
+// Plans every second-measure beat that starts during this first-measure beat. Each starts at its exact
+// point along this beat, so the two measures agree even when the tempo changes between beats. A beat that
+// runs past this one assumes the tempo holds, which only matters for its animation.
+void Sequencer::planLayerBeats(const BeatEvent& lead) {
+    const int beats = activeBeats_[1];
+    const double ratio = activeOverlap_ == OverlapSameBar ? double(activeBeats_[0]) / beats
+                                                          : double(activeDenominator_[0]) / activeDenominator_[1];
+    const double end = double(leadIndex_ + 1) - 1e-9;
+    while (layerCount_ < kLayerQueueSize) {
+        if (layerBeat_ >= beats) {
+            if (activeOverlap_ == OverlapSameBar) return;  // Waits for the first measure's next bar.
+            layerBarStart_ += beats * ratio;
+            layerBeat_ = 0;
+        }
+        const double at = layerBarStart_ + layerBeat_ * ratio;
+        if (at >= end) return;
+
+        BeatEvent e = lead;
+        e.start = lead.start + (at - double(leadIndex_)) * lead.duration;
+        e.duration = ratio * lead.duration;
+        e.layer = 1;
+        e.measure = 1;
+        e.beat = layerBeat_;
+        e.subdivision = 1;
+        e.nextMeasure = 1;
+        e.nextBeat = (layerBeat_ + 1) % beats;
+        layerQueue_[(layerHead_ + layerCount_) % kLayerQueueSize] = e;
+        ++layerCount_;
+        pushEvent(e);
+        ++layerBeat_;
+    }
+}
+
+int64_t Sequencer::layerDue() const {
+    return layerCount_ > 0 ? std::llround(layerQueue_[layerHead_].start) : INT64_MAX;
+}
+
+void Sequencer::fireLayerTick() {
+    const BeatEvent& e = layerQueue_[layerHead_];
+    const BeatSettings& settings = cfg_.measure[1].beat[e.beat];
+    const double gain = kLevelGain[std::clamp(settings.level, 0, 3)];
+    if (tickObserver) tickObserver({pos_, 1, e.beat, 0, gain});
+    if (gain > 0) startVoice(settings, gain);
+    layerHead_ = (layerHead_ + 1) % kLayerQueueSize;
+    --layerCount_;
 }
 
 void Sequencer::fireTick() {
@@ -132,12 +197,17 @@ void Sequencer::render(float* out, int frames, int channels) {
         int n = frames - done;
         if (running_) {
             planIfNeeded(n);
-            int64_t due = std::llround(nextTick_);
+            int64_t due = std::min(std::llround(nextTick_), layerDue());
             while (due <= pos_) {
-                if (subIndex_ == 0 && !hasPlanned_) planBeat();
-                fireTick();
+                // The first measure goes first, because its plan creates the second measure's beats.
+                if (std::llround(nextTick_) <= pos_) {
+                    if (subIndex_ == 0 && !hasPlanned_) planBeat();
+                    fireTick();
+                } else {
+                    fireLayerTick();
+                }
                 planIfNeeded(n);
-                due = std::llround(nextTick_);
+                due = std::min(std::llround(nextTick_), layerDue());
             }
             n = int(std::min<int64_t>(n, due - pos_));
         }

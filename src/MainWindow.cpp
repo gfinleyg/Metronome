@@ -4,6 +4,7 @@
 #include "TempoDial.h"
 
 #include <QApplication>
+#include <QBoxLayout>
 #include <QCheckBox>
 #include <QCloseEvent>
 #include <QComboBox>
@@ -27,6 +28,7 @@
 #include <QVBoxLayout>
 #include <algorithm>
 #include <cmath>
+#include <functional>
 
 namespace {
 struct Signature {
@@ -37,6 +39,12 @@ const char* const kSoundNames[SoundCount] = {"Woodblock", "Click", "Beep", "Cowb
 constexpr int kTrainerBeatStep = 4;
 constexpr double kPresentFrames = 2.0;  // Render to swap to scanout, in refresh intervals.
 constexpr double kStopSettleSeconds = 0.8;
+constexpr double kMaxGaugeShare = 0.38;  // Of the window width, so the notes always have room.
+constexpr int kMinControlsOpacity = 30;
+constexpr double kMinDockedGaugeShare = 0.30;  // The metronome gives up this much width to fit docked controls, and no more.
+constexpr int kFloatingDialSize = 150;
+constexpr int kDockedDialSize = 110;
+constexpr int kWindowMargins = 22;
 
 const char* const kStyle = R"(
 QWidget { background: #1d1f23; color: #e6e6e6; font-size: 12px; }
@@ -44,7 +52,6 @@ QLabel#heading { color: #9aa0aa; font-weight: bold; letter-spacing: 1px; }
 QLabel#bpm { font-size: 30px; font-weight: bold; }
 QLabel#tempoName { color: #e8a317; font-size: 15px; }
 QLabel#hint { color: #9aa0aa; font-size: 11px; }
-QLabel#warning { color: #ff7a70; }
 QPushButton { background: #30343b; border: 1px solid #454a53; border-radius: 4px; padding: 5px 7px; }
 QPushButton:hover { background: #3b4048; }
 QPushButton:checked { background: #e8a317; color: #16171a; border-color: #e8a317; font-weight: bold; }
@@ -137,10 +144,34 @@ private:
     std::vector<Badge> badges_;
 };
 
+// Every control that is not per-beat. It floats beside the metronome rather than taking space from it.
+class ControlsWindow : public QWidget {
+public:
+    ControlsWindow(QWidget* parent, std::function<void()> onClose) : QWidget(parent, Qt::Tool), overlay(new ShortcutOverlay(this)), onClose_(std::move(onClose)) {
+        setWindowTitle("Metronome controls");
+        setAttribute(Qt::WA_ShowWithoutActivating);
+    }
+
+    ShortcutOverlay* overlay;
+
+protected:
+    void closeEvent(QCloseEvent* event) override {
+        event->ignore();  // Closing only hides it, so its position and contents survive.
+        onClose_();
+    }
+    void resizeEvent(QResizeEvent* event) override {
+        QWidget::resizeEvent(event);
+        overlay->setGeometry(rect());
+    }
+
+private:
+    std::function<void()> onClose_;
+};
+
 MainWindow::MainWindow(const DiagnoseOptions& diagnose) : diagnose_(diagnose) {
     setWindowTitle("Metronome");
     setMinimumSize(1040, 710);
-    resize(1100, 760);
+    resize(1280, 800);
     setStyleSheet(kStyle);
     tapClock_.start();
 
@@ -149,32 +180,17 @@ MainWindow::MainWindow(const DiagnoseOptions& diagnose) : diagnose_(diagnose) {
     gauge_ = new GaugeView(&frame_);
     strip_ = new BeatStripView(&frame_, &cfg_);
 
-    auto* centerColumn = new QVBoxLayout;
-    centerColumn->addWidget(buildSignatureGroup());
-    centerColumn->addWidget(buildTempoGroup(), 1);
-    auto* rightColumn = new QVBoxLayout;
-    rightColumn->addWidget(buildSoundGroup());
-    rightColumn->addSpacing(8);
-    rightColumn->addWidget(buildTrainerGroup());
-    rightColumn->addStretch(1);
-
-    auto* centerHost = new QWidget;
-    centerHost->setLayout(centerColumn);
-    auto* rightHost = new QWidget;
-    rightHost->setLayout(rightColumn);
-
-    auto* top = new QHBoxLayout;
-    top->addWidget(gauge_, 3);
-    top->addWidget(centerHost, 4);
-    top->addWidget(rightHost, 3);
-
-    auto* root = new QVBoxLayout(this);
-    root->setContentsMargins(10, 10, 10, 10);
-    root->addLayout(top, 1);
-    root->addWidget(strip_);
+    auto* root = new QHBoxLayout(this);
+    root->setContentsMargins(8, 8, 8, 8);
+    root->addWidget(gauge_);
+    notesColumn_ = new QVBoxLayout;
+    notesColumn_->addWidget(strip_, 1);
+    root->addLayout(notesColumn_, 1);
 
     overlay_ = new ShortcutOverlay(this);
+    buildControlsWindow();
 
+    connect(gauge_, &GaugeView::controlsButtonClicked, this, [this] { setControlsOpen(!controlsOpen_); });
     connect(strip_, &BeatStripView::beatSelected, this, &MainWindow::selectBeat);
     connect(strip_, &BeatStripView::pitchStepped, this, &MainWindow::stepPitch);
     connect(strip_, &BeatStripView::levelSet, this, &MainWindow::setLevel);
@@ -186,7 +202,7 @@ MainWindow::MainWindow(const DiagnoseOptions& diagnose) : diagnose_(diagnose) {
     });
     auto* watchdog = new QTimer(this);  // Restarts the frame loop if a hidden window paused it.
     connect(watchdog, &QTimer::timeout, this, [this] {
-        audioStatus_->setVisible(!engine_.hasDevice());
+        gauge_->setNoAudio(!engine_.hasDevice());
         if (animating()) kick();
     });
     watchdog->start(250);
@@ -197,6 +213,14 @@ MainWindow::MainWindow(const DiagnoseOptions& diagnose) : diagnose_(diagnose) {
 
     if (diagnose_.enabled()) {
         cfg_.masterVolume = 0;
+        if (diagnose_.beats > 0) cfg_.measure[0].beats = std::clamp(diagnose_.beats, 1, kMaxBeats);
+        cfg_.trainerEnabled = diagnose_.trainer;
+        if (diagnose_.overlap != OverlapOff) {
+            cfg_.secondMeasure = true;
+            cfg_.overlap = diagnose_.overlap;
+            cfg_.measure[1].beats = 3;
+            cfg_.measure[1].denominator = 4;
+        }
         if (diagnose_.twoMeasures) {
             cfg_.secondMeasure = true;
             cfg_.measure[1].beats = 6;
@@ -211,6 +235,8 @@ MainWindow::MainWindow(const DiagnoseOptions& diagnose) : diagnose_(diagnose) {
     clampSelection();
     secondCheck_->setChecked(cfg_.secondMeasure);
     signatureRow_[1]->setVisible(cfg_.secondMeasure);
+    overlapRow_->setVisible(cfg_.secondMeasure);
+    refreshOverlapUi();
     trainerButton_->setChecked(cfg_.trainerEnabled);
     volumeSlider_->setValue(int(std::round(cfg_.masterVolume * 100)));
     everySlider_->setValue(cfg_.trainerEveryBeats / kTrainerBeatStep);
@@ -218,7 +244,24 @@ MainWindow::MainWindow(const DiagnoseOptions& diagnose) : diagnose_(diagnose) {
     offsetSlider_->setValue(audioOffsetMs_);
     // setValue stays silent when a slider is already at that value, which would leave its label empty.
     for (QSlider* slider : {volumeSlider_, everySlider_, addSlider_, offsetSlider_}) emit slider->valueChanged(slider->value());
+    measureDockWidth();
     pushConfig();
+
+    // Controls only open once the window they float over is on screen.
+    bool openControls = diagnose_.controlsOpacity > 0 || diagnose_.docked;
+    int opacity = diagnose_.controlsOpacity > 0 ? diagnose_.controlsOpacity : 100;
+    dockWanted_ = diagnose_.docked;
+    if (!diagnose_.enabled()) {
+        QSettings s;
+        openControls = s.value("controls/open", true).toBool();
+        opacity = s.value("controls/opacity", 100).toInt();
+        dockWanted_ = s.value("controls/docked", false).toBool();
+        const QByteArray geometry = s.value("controls/geometry").toByteArray();
+        if (!geometry.isEmpty()) controlsPlaced_ = controls_->restoreGeometry(geometry);
+    }
+    opacitySlider_->setValue(opacity);
+    emit opacitySlider_->valueChanged(opacitySlider_->value());
+    if (openControls) QTimer::singleShot(0, this, [this] { setControlsOpen(true); });
 
     if (diagnose_.enabled()) {
         QTimer::singleShot(500, this, [this] {
@@ -230,6 +273,104 @@ MainWindow::MainWindow(const DiagnoseOptions& diagnose) : diagnose_(diagnose) {
 }
 
 MainWindow::~MainWindow() { qApp->removeEventFilter(this); }
+
+void MainWindow::buildControlsWindow() {
+    controls_ = new ControlsWindow(this, [this] { setControlsOpen(false); });
+    auto* column = new QVBoxLayout(controls_);
+    column->setSizeConstraint(QLayout::SetFixedSize);
+    column->setContentsMargins(12, 12, 12, 12);
+
+    // The same widgets serve both places: a column when floating, a row when docked.
+    const auto stack = [](QWidget* top, QWidget* bottom) {
+        auto* host = new QWidget;
+        auto* layout = new QVBoxLayout(host);
+        layout->setContentsMargins(0, 0, 0, 0);
+        layout->setSpacing(10);
+        layout->addWidget(top);
+        layout->addWidget(bottom);
+        return host;
+    };
+    controlsBody_ = new QWidget;
+    controlsBodyLayout_ = new QBoxLayout(QBoxLayout::TopToBottom, controlsBody_);
+    controlsBodyLayout_->setContentsMargins(0, 0, 0, 0);
+    QWidget* transport = buildTransportRow();
+    controlsBodyLayout_->addWidget(stack(transport, buildTempoGroup()), 0, Qt::AlignTop);
+    controlsBodyLayout_->addWidget(buildSignatureGroup(), 0, Qt::AlignTop);
+    controlsBodyLayout_->addWidget(buildSoundGroup(), 0, Qt::AlignTop);
+    QWidget* trainer = buildTrainerGroup();
+    controlsBodyLayout_->addWidget(stack(trainer, buildWindowGroup()), 0, Qt::AlignTop);
+    column->addWidget(controlsBody_);
+    dial_->setMinimumSize(kFloatingDialSize, kFloatingDialSize);
+}
+
+// Tries the docked shape, so the window knows how wide it must be to dock. The labels need their text
+// by now, because their text sets the width. The trainer's longest status is measured for the same reason.
+void MainWindow::measureDockWidth() {
+    const QString status = trainerStatus_->text();
+    trainerStatus_->setText("Starts counting when you press Start");
+    controlsBody_->ensurePolished();
+    controlsBodyLayout_->setDirection(QBoxLayout::LeftToRight);
+    controlsBodyLayout_->setSpacing(18);
+    dial_->setMinimumSize(kDockedDialSize, kDockedDialSize);
+    signatureRow_[1]->hide();
+    overlapRow_->hide();
+    opacityRow_->hide();
+    dockMinWidth_ = controlsBody_->minimumSizeHint().width() + 8;
+    controlsBodyLayout_->setDirection(QBoxLayout::TopToBottom);
+    controlsBodyLayout_->setSpacing(10);
+    dial_->setMinimumSize(kFloatingDialSize, kFloatingDialSize);
+    signatureRow_[1]->setVisible(cfg_.secondMeasure);
+    overlapRow_->setVisible(cfg_.secondMeasure);
+    opacityRow_->show();
+    trainerStatus_->setText(status);
+}
+
+QWidget* MainWindow::buildTransportRow() {
+    auto* host = new QWidget;
+    auto* buttons = new QHBoxLayout(host);
+    buttons->setContentsMargins(0, 0, 0, 0);
+    tapButton_ = new QPushButton("TAP");
+    connect(tapButton_, &QPushButton::pressed, this, &MainWindow::tapTempo);
+    startButton_ = new QPushButton("▶  START");
+    startButton_->setObjectName("start");
+    startButton_->setCheckable(true);
+    connect(startButton_, &QPushButton::clicked, this, &MainWindow::toggleRunning);
+    buttons->addWidget(tapButton_, 1);
+    buttons->addWidget(startButton_, 2);
+    return host;
+}
+
+QWidget* MainWindow::buildWindowGroup() {
+    auto* host = new QWidget;
+    auto* grid = new QGridLayout(host);
+    grid->setContentsMargins(0, 0, 0, 0);
+    grid->addWidget(heading("CONTROLS WINDOW"), 0, 0);
+    dockButton_ = new QPushButton("Dock under notes");
+    dockButton_->setCheckable(true);
+    connect(dockButton_, &QPushButton::clicked, this, &MainWindow::setControlsDocked);
+    grid->addWidget(dockButton_, 1, 0);
+    dockHint_ = new QLabel;
+    dockHint_->setObjectName("hint");
+    dockHint_->hide();
+    grid->addWidget(dockHint_, 2, 0);
+
+    opacityRow_ = new QWidget;
+    auto* row = new QHBoxLayout(opacityRow_);
+    row->setContentsMargins(0, 0, 0, 0);
+    row->addWidget(new QLabel("Opacity"));
+    opacitySlider_ = new QSlider(Qt::Horizontal);
+    opacitySlider_->setRange(kMinControlsOpacity, 100);
+    row->addWidget(opacitySlider_, 1);
+    opacityValue_ = new QLabel;
+    opacityValue_->setMinimumWidth(52);
+    row->addWidget(opacityValue_);
+    grid->addWidget(opacityRow_, 3, 0);
+    connect(opacitySlider_, &QSlider::valueChanged, this, [this](int percent) {
+        opacityValue_->setText(QString("%1%").arg(percent));
+        controls_->setWindowOpacity(percent / 100.0);
+    });
+    return host;
+}
 
 QWidget* MainWindow::buildSignatureRow(int measure) {
     auto* host = new QWidget;
@@ -263,6 +404,27 @@ QWidget* MainWindow::buildSignatureGroup() {
     secondCheck_ = new QCheckBox("Second measure");
     connect(secondCheck_, &QCheckBox::clicked, this, &MainWindow::setSecondMeasure);
     layout->addWidget(secondCheck_);
+
+    overlapRow_ = new QWidget;
+    auto* modes = new QHBoxLayout(overlapRow_);
+    modes->setContentsMargins(0, 0, 0, 0);
+    modes->setSpacing(4);
+    modes->addWidget(new QLabel("Plays"));
+    const char* const names[OverlapCount] = {"After", "Same bar", "Same beat"};
+    const char* const tips[OverlapCount] = {
+        "Measure 2 plays after measure 1.",
+        "Both measures play together and each bar lasts the same time, so 3/4 over 4/4 is 3 against 4.",
+        "Both measures play together on the same beat. Their downbeats drift apart and meet again later.",
+    };
+    for (int i = 0; i < OverlapCount; ++i) {
+        auto* button = new QPushButton(names[i]);
+        button->setCheckable(true);
+        button->setToolTip(tips[i]);
+        connect(button, &QPushButton::clicked, this, [this, i] { setOverlap(i); });
+        modes->addWidget(button, 1);
+        overlapButtons_.push_back(button);
+    }
+    layout->addWidget(overlapRow_);
     for (int m = 0; m < 2; ++m) {
         signatureRow_[m] = buildSignatureRow(m);
         layout->addWidget(signatureRow_[m]);
@@ -273,7 +435,7 @@ QWidget* MainWindow::buildSignatureGroup() {
 QWidget* MainWindow::buildTempoGroup() {
     auto* host = new QWidget;
     auto* layout = new QVBoxLayout(host);
-    layout->setContentsMargins(0, 8, 0, 0);
+    layout->setContentsMargins(0, 0, 0, 0);
     layout->addWidget(heading("TEMPO"));
 
     auto* labels = new QVBoxLayout;
@@ -308,16 +470,6 @@ QWidget* MainWindow::buildTempoGroup() {
     row->addWidget(dial_, 1);
     layout->addLayout(row, 1);
 
-    tapButton_ = new QPushButton("TAP");
-    connect(tapButton_, &QPushButton::pressed, this, &MainWindow::tapTempo);
-    startButton_ = new QPushButton("▶  START");
-    startButton_->setObjectName("start");
-    startButton_->setCheckable(true);
-    connect(startButton_, &QPushButton::clicked, this, &MainWindow::toggleRunning);
-    auto* buttons = new QHBoxLayout;
-    buttons->addWidget(tapButton_, 1);
-    buttons->addWidget(startButton_, 2);
-    layout->addLayout(buttons);
     return host;
 }
 
@@ -376,10 +528,6 @@ QWidget* MainWindow::buildSoundGroup() {
     hint->setWordWrap(true);
     grid->addWidget(hint, 5, 0, 1, 3);
 
-    audioStatus_ = new QLabel("No audio output found. Visuals only.");
-    audioStatus_->setObjectName("warning");
-    audioStatus_->hide();
-    grid->addWidget(audioStatus_, 6, 0, 1, 3);
     return host;
 }
 
@@ -442,7 +590,7 @@ bool MainWindow::animating() const {
 
 void MainWindow::computeFrame() {
     BeatEvent incoming;
-    while (engine_.popEvent(incoming)) timeline_.push(incoming);
+    while (engine_.popEvent(incoming)) (incoming.layer ? layerTimeline_ : timeline_).push(incoming);
 
     const AudioEngine::Clock clock = engine_.clock();
     const double now = AudioEngine::nowSeconds();
@@ -468,6 +616,19 @@ void MainWindow::computeFrame() {
                 lastFlashStart_ = e->start;
                 flashLateMs_.push_back(next.sinceSec * 1000.0);
             }
+            if (e->overlap != OverlapOff) {
+                if (const BeatEvent* layer = layerTimeline_.at(t)) {
+                    next.hasLayerBeat = true;
+                    next.layerEvent = *layer;
+                    next.layerSinceSec = (t - layer->start) / clock.sampleRate;
+                    next.layerBeatSec = layer->duration / clock.sampleRate;
+                    next.layerPhase = std::clamp(next.layerSinceSec / next.layerBeatSec, 0.0, 1.0);
+                    if (diagnose_.enabled() && layer->start != lastLayerFlashStart_) {
+                        lastLayerFlashStart_ = layer->start;
+                        flashLateMs_.push_back(next.layerSinceSec * 1000.0);
+                    }
+                }
+            }
             // Show speed trainer increases as they are heard, unless the user has just changed the tempo.
             if (e->bpmRevision == cfg_.bpmRevision && e->bpm != cfg_.bpm) {
                 cfg_.bpm = e->bpm;
@@ -475,11 +636,11 @@ void MainWindow::computeFrame() {
             }
             if (cfg_.trainerEnabled) {
                 if (e->bpm >= kMaxBpm)
-                    trainerStatus_->setText("At top speed (250 BPM)");
+                    gauge_->setTrainerStatus("At top speed (250 BPM)");
                 else if (e->beatsUntilIncrease > 0)
-                    trainerStatus_->setText(QString("Next +%1 in %2 beats").arg(cfg_.trainerAddBpm).arg(e->beatsUntilIncrease));
+                    gauge_->setTrainerStatus(QString("Next +%1 in %2 beats").arg(cfg_.trainerAddBpm).arg(e->beatsUntilIncrease));
                 else
-                    trainerStatus_->setText(QString("Next +%1 at the next measure").arg(cfg_.trainerAddBpm));
+                    gauge_->setTrainerStatus(QString("Next +%1 at the next measure").arg(cfg_.trainerAddBpm));
             }
         } else if (const BeatEvent* firstBeat = timeline_.first()) {
             // Swing out from rest to reach the first tick on time.
@@ -492,12 +653,6 @@ void MainWindow::computeFrame() {
         next.armPosition = lastArm_ * std::exp(-(now - stoppedAt_) / 0.12);
     }
     frame_ = next;
-
-    const int rows = (frame_.hasBeat ? frame_.event.second : cfg_.secondMeasure) ? 2 : 1;
-    if (rows != stripRows_) {
-        stripRows_ = rows;
-        strip_->setFixedHeight(BeatStripView::heightForRows(rows));
-    }
 
     // The layout can shift at a measure boundary while Ctrl is held.
     if (overlay_->isVisible()) updateShortcutBadges();
@@ -512,10 +667,11 @@ void MainWindow::toggleRunning() {
     if (cfg_.running) {
         ++cfg_.runId;
         timeline_.reset(cfg_.runId);
+        layerTimeline_.reset(cfg_.runId);
     } else {
         stoppedAt_ = AudioEngine::nowSeconds();
-        refreshTrainerStatus();
     }
+    refreshTrainerStatus();
     pushConfig();
 }
 
@@ -556,7 +712,7 @@ void MainWindow::cycleSignature(int measure, int delta) {
 }
 
 void MainWindow::editCustomSignature(int measure) {
-    QDialog dialog(this);
+    QDialog dialog(controls_);
     dialog.setWindowTitle(QString("Custom time signature, measure %1").arg(measure + 1));
     auto* form = new QFormLayout(&dialog);
     auto* beats = new QSpinBox;
@@ -581,7 +737,15 @@ void MainWindow::setSecondMeasure(bool on) {
     cfg_.secondMeasure = on;
     secondCheck_->setChecked(on);
     signatureRow_[1]->setVisible(on);
+    overlapRow_->setVisible(on);
     clampSelection();
+    pushConfig();
+    QTimer::singleShot(0, this, &MainWindow::applyControlsPlacement);
+}
+
+void MainWindow::setOverlap(int overlap) {
+    cfg_.overlap = std::clamp(overlap, 0, OverlapCount - 1);
+    refreshOverlapUi();
     pushConfig();
 }
 
@@ -660,6 +824,57 @@ void MainWindow::showSoundMenu(int measure, int beat, QPoint globalPos) {
     menu.exec(globalPos);
 }
 
+void MainWindow::setControlsOpen(bool open) {
+    controlsOpen_ = open;
+    applyControlsPlacement();
+}
+
+void MainWindow::setControlsDocked(bool docked) {
+    dockWanted_ = docked;
+    dockButton_->setChecked(docked);
+    // Queued, because the button that was clicked is about to move.
+    QTimer::singleShot(0, this, &MainWindow::applyControlsPlacement);
+}
+
+void MainWindow::applyControlsPlacement() {
+    const bool wideEnough = dockMinWidth_ > 0 && width() * (1.0 - kMinDockedGaugeShare) >= dockMinWidth_ + kWindowMargins;
+    const bool docked = dockWanted_ && !cfg_.secondMeasure && wideEnough;
+
+    if (docked != docked_) {
+        docked_ = docked;
+        // Docked controls need no opacity, and their row should not grow taller than the notes need.
+        opacityRow_->setVisible(!docked);
+        dial_->setMinimumSize(docked ? kDockedDialSize : kFloatingDialSize, docked ? kDockedDialSize : kFloatingDialSize);
+        controlsBodyLayout_->setDirection(docked ? QBoxLayout::LeftToRight : QBoxLayout::TopToBottom);
+        controlsBodyLayout_->setSpacing(docked ? 18 : 10);
+        if (docked)
+            notesColumn_->addWidget(controlsBody_);
+        else
+            controls_->layout()->addWidget(controlsBody_);
+    }
+
+    controlsBody_->setVisible(controlsOpen_ || !docked);
+    if (controlsOpen_ && !docked && !controlsPlaced_) {
+        // First use: inside the top-right corner of the window, ready to be dragged anywhere.
+        const QSize size = controls_->sizeHint();
+        controls_->move(frameGeometry().right() - size.width() - 40, frameGeometry().top() + 60);
+        controlsPlaced_ = true;
+    }
+    controls_->setVisible(controlsOpen_ && !docked);
+    gauge_->setControlsOpen(controlsOpen_);
+    dockButton_->setChecked(dockWanted_);
+    dockHint_->setText(cfg_.secondMeasure ? "Docks when only one measure is on" : "Window is too narrow to dock");
+    dockHint_->setVisible(dockWanted_ && !docked);
+    updateGaugeWidth();
+    if (overlay_->isVisible()) showShortcuts(true);
+}
+
+void MainWindow::updateGaugeWidth() {
+    int gauge = std::min(int((height() - 16) * GaugeView::kAspect), int(width() * kMaxGaugeShare));
+    if (docked_) gauge = std::min(gauge, width() - kWindowMargins - dockMinWidth_);
+    gauge_->setFixedWidth(gauge);
+}
+
 bool MainWindow::eventFilter(QObject* watched, QEvent* event) {
     const QEvent::Type type = event->type();
     if (type == QEvent::ApplicationDeactivate) {
@@ -703,11 +918,20 @@ bool MainWindow::handleKey(QKeyEvent* event) {
     case Qt::Key_Right:
         moveSelection(1);
         return true;
+    case Qt::Key_Tab:
+        if (!repeat) setControlsOpen(!controlsOpen_);
+        return true;
+    case Qt::Key_D:
+        if (!repeat) setControlsDocked(!dockWanted_);
+        return true;
     case Qt::Key_T:
         if (!repeat) tapTempo();
         return true;
     case Qt::Key_M:
         if (!repeat) setSecondMeasure(!cfg_.secondMeasure);
+        return true;
+    case Qt::Key_O:
+        if (!repeat && cfg_.secondMeasure) setOverlap((cfg_.overlap + 1) % OverlapCount);
         return true;
     case Qt::Key_R:
         if (!repeat) setTrainer(!cfg_.trainerEnabled);
@@ -750,19 +974,33 @@ bool MainWindow::handleKey(QKeyEvent* event) {
 void MainWindow::showShortcuts(bool show) {
     if (!show) {
         overlay_->hide();
+        controls_->overlay->hide();
         return;
     }
     updateShortcutBadges();
     overlay_->setGeometry(rect());
     overlay_->raise();
     overlay_->show();
+    // A floating controls window has its own badges, which only make sense while it is open.
+    controls_->overlay->setVisible(controlsOpen_ && !docked_);
+    controls_->overlay->raise();
 }
 
 void MainWindow::updateShortcutBadges() {
-    const auto mapped = [this](QWidget* widget) { return QRect(widget->mapTo(this, QPoint(0, 0)), widget->size()); };
     const auto mappedStrip = [this](const QRectF& r) {
         return QRect(strip_->mapTo(this, r.topLeft().toPoint()), r.size().toSize());
     };
+    const QRect button = gauge_->controlsButtonRect();
+    std::vector<ShortcutOverlay::Badge> mainBadges = {
+        {QRect(gauge_->mapTo(this, button.topLeft()), button.size()), "Tab"},
+        {mappedStrip(strip_->noteRect(selectedMeasure_, selectedBeat_)), "← →"},
+        {mappedStrip(strip_->pitchRect(selectedMeasure_, selectedBeat_)), "Shift+↑↓"},
+        {mappedStrip(strip_->levelRect(selectedMeasure_, selectedBeat_)), "V"},
+        {mappedStrip(strip_->soundRect(selectedMeasure_, selectedBeat_)), "K"},
+    };
+
+    QWidget* holder = docked_ ? static_cast<QWidget*>(this) : controls_;
+    const auto mapped = [holder](QWidget* widget) { return QRect(widget->mapTo(holder, QPoint(0, 0)), widget->size()); };
     std::vector<ShortcutOverlay::Badge> badges = {
         {mapped(startButton_), "Space"},
         {mapped(tapButton_), "T"},
@@ -774,22 +1012,27 @@ void MainWindow::updateShortcutBadges() {
         {mapped(addSlider_), "A  Shift+A"},
         {mapped(signatureRow_[0]), "N  Shift+N"},
         {mapped(volumeSlider_), "[  ]"},
-        {mappedStrip(strip_->noteRect(selectedMeasure_, selectedBeat_)), "← →"},
-        {mappedStrip(strip_->pitchRect(selectedMeasure_, selectedBeat_)), "Shift+↑↓"},
-        {mappedStrip(strip_->levelRect(selectedMeasure_, selectedBeat_)), "V"},
-        {mappedStrip(strip_->soundRect(selectedMeasure_, selectedBeat_)), "K"},
+        {mapped(dockButton_), "D"},
     };
-    if (cfg_.secondMeasure) badges.push_back({mapped(signatureRow_[1]), "B  Shift+B"});
-    overlay_->setBadges(std::move(badges));
+    if (cfg_.secondMeasure) {
+        badges.push_back({mapped(signatureRow_[1]), "B  Shift+B"});
+        badges.push_back({mapped(overlapRow_), "O"});
+    }
+    if (docked_ && controlsOpen_) mainBadges.insert(mainBadges.end(), badges.begin(), badges.end());
+    overlay_->setBadges(std::move(mainBadges));
+    if (!docked_) controls_->overlay->setBadges(std::move(badges));
 }
 
 void MainWindow::resizeEvent(QResizeEvent* event) {
     QWidget::resizeEvent(event);
-    if (overlay_) overlay_->setGeometry(rect());
+    if (!overlay_) return;
+    overlay_->setGeometry(rect());
+    applyControlsPlacement();
 }
 
 void MainWindow::refreshTempoUi() {
     dial_->setValue(cfg_.bpm);
+    gauge_->setTempo(cfg_.bpm, tempoName(cfg_.bpm));
     bpmLabel_->setText(QString("%1 BPM").arg(cfg_.bpm));
     tempoNameLabel_->setText(tempoName(cfg_.bpm));
     unitLabel_->setText("Counting " + noteValueName(cfg_.measure[0].denominator));
@@ -814,14 +1057,23 @@ void MainWindow::refreshSubdivisionUi() {
     for (size_t i = 0; i < subdivisionButtons_.size(); ++i) subdivisionButtons_[i]->setChecked(int(i) + 1 == cfg_.subdivision);
 }
 
+void MainWindow::refreshOverlapUi() {
+    for (size_t i = 0; i < overlapButtons_.size(); ++i) overlapButtons_[i]->setChecked(int(i) == cfg_.overlap);
+}
+
 void MainWindow::refreshTrainerStatus() {
-    trainerStatus_->setText(cfg_.trainerEnabled ? "Starts counting when you press Start" : "Off");
+    if (!cfg_.trainerEnabled)
+        trainerStatus_->setText("Off");
+    else
+        trainerStatus_->setText(cfg_.running ? "Countdown is beside the metronome" : "Starts counting when you press Start");
+    gauge_->setTrainerStatus({});
 }
 
 void MainWindow::loadSettings() {
     QSettings s;
     cfg_.bpm = std::clamp(s.value("tempo", cfg_.bpm).toInt(), kMinBpm, kMaxBpm);
     cfg_.secondMeasure = s.value("secondMeasure", false).toBool();
+    cfg_.overlap = std::clamp(s.value("overlap", int(OverlapOff)).toInt(), 0, OverlapCount - 1);
     cfg_.subdivision = std::clamp(s.value("subdivision", 1).toInt(), 1, 4);
     cfg_.masterVolume = std::clamp(s.value("volume", 0.7).toFloat(), 0.0f, 1.0f);
     cfg_.trainerEnabled = s.value("trainer/enabled", false).toBool();
@@ -850,6 +1102,7 @@ void MainWindow::saveSettings() const {
     QSettings s;
     s.setValue("tempo", cfg_.bpm);
     s.setValue("secondMeasure", cfg_.secondMeasure);
+    s.setValue("overlap", cfg_.overlap);
     s.setValue("subdivision", cfg_.subdivision);
     s.setValue("volume", cfg_.masterVolume);
     s.setValue("trainer/enabled", cfg_.trainerEnabled);
@@ -870,15 +1123,23 @@ void MainWindow::saveSettings() const {
         }
     }
     s.setValue("window/geometry", saveGeometry());
+    s.setValue("controls/open", controlsOpen_);
+    s.setValue("controls/docked", dockWanted_);
+    s.setValue("controls/opacity", opacitySlider_->value());
+    if (controlsPlaced_) s.setValue("controls/geometry", controls_->saveGeometry());
 }
 
 void MainWindow::closeEvent(QCloseEvent* event) {
     if (!diagnose_.enabled()) saveSettings();
+    controls_->hide();
     QWidget::closeEvent(event);
 }
 
 void MainWindow::finishDiagnose() {
-    if (!diagnose_.screenshotPath.isEmpty()) grab().save(diagnose_.screenshotPath);
+    if (!diagnose_.screenshotPath.isEmpty()) {
+        grab().save(diagnose_.screenshotPath);
+        if (controls_->isVisible()) controls_->grab().save(diagnose_.screenshotPath + ".controls.png");
+    }
 
     QFile csv(diagnose_.csvPath);
     std::vector<double> intervals, clockError;
@@ -918,6 +1179,9 @@ void MainWindow::finishDiagnose() {
         out << "beats_displayed " << flashLateMs_.size() << "\n";
         out << "flash_late_ms p50 " << percentile(flashLateMs_, 0.5) << " p99 " << percentile(flashLateMs_, 0.99) << " max "
             << percentile(flashLateMs_, 1.0) << "\n";
+        out << "flash_late_each";
+        for (double late : flashLateMs_) out << ' ' << late;
+        out << "\n";
     }
     close();
 }

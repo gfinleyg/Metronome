@@ -11,10 +11,15 @@ constexpr int kNoteG5 = 79;
 
 enum TickSound { SoundWoodblock, SoundClick, SoundBeep, SoundCowbell, SoundHiHat, SoundCount };
 
+// How the second measure relates to the first: after it, or over it. Over it, the bars can match in
+// length (a polyrhythm, such as 3 against 4) or the beats can (a polymeter, which realigns later).
+enum Overlap { OverlapOff, OverlapSameBar, OverlapSameBeat, OverlapCount };
+
 struct BeatSettings {
     int midiNote = kNoteG5;
     int level = 2;  // 0 off, 1 low, 2 medium, 3 max
     int sound = SoundWoodblock;
+    bool operator==(const BeatSettings&) const = default;
 };
 
 struct MeasureConfig {
@@ -32,6 +37,7 @@ struct MeasureConfig {
 struct SequenceConfig {
     MeasureConfig measure[2];
     bool secondMeasure = false;
+    int overlap = OverlapOff;
     int bpm = 120;
     uint32_t bpmRevision = 0;  // Bumped on user edits, so trainer increases are not overwritten.
     int subdivision = 1;
@@ -57,6 +63,8 @@ struct BeatEvent {
     int beats[2] = {4, 4};
     int denominator[2] = {4, 4};
     bool second = false;
+    int overlap = OverlapOff;
+    int layer = 0;  // 1 for the second measure when it plays over the first.
     int beatsUntilIncrease = 0;
     uint32_t bpmRevision = 0;
     uint32_t runId = 0;
